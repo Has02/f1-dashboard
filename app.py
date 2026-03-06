@@ -19,6 +19,17 @@ try:
 except ImportError:
     TELEMETRY_AVAILABLE = False
 
+# ── Data layer (FastF1 + OpenF1 unified) ──────────────────────────────────────
+try:
+    from data_layer import (
+        fastf1_available, get_track_outline,
+        get_multi_driver_telemetry, get_delta_to_ref,
+    )
+    DATA_LAYER_AVAILABLE = True
+except ImportError:
+    DATA_LAYER_AVAILABLE = False
+    def fastf1_available(): return False
+
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -240,7 +251,13 @@ with st.sidebar:
                                format_func=lambda i: meeting_labels[i],
                                index=len(meeting_labels)-1)
     selected_meeting = meetings_df.iloc[meeting_idx]
-    meeting_key = selected_meeting["meeting_key"]
+    meeting_key      = selected_meeting["meeting_key"]
+    # Use location string for FastF1 lookup — avoids index mismatch when
+    # calendar has gaps (pre-season tests, cancelled rounds, etc.)
+    meeting_location = str(
+        selected_meeting.get("meeting_official_name",
+        selected_meeting.get("meeting_name",
+        selected_meeting.get("country_name", str(meeting_idx + 1)))))
 
     sessions_df = get_sessions(meeting_key)
     if sessions_df.empty:
@@ -264,7 +281,7 @@ with st.sidebar:
                                format_func=lambda i: session_types[i],
                                index=len(session_types)-1)
     selected_session = sessions_df.iloc[session_idx]
-    session_key = int(selected_session["session_key"])
+    session_key  = int(selected_session["session_key"])
     session_type = selected_session.get("session_name","")
 
     # Warn if sparse session selected for telemetry
@@ -381,7 +398,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 # ─── TABS ─────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📈 Lap Times",
     "🔵 Sector Breakdown",
     "⚡ Sector Delta",
@@ -390,6 +407,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🔧 Tyre Strategy",
     "📻 Team Radio",
     "📋 Lap Table",
+    "🔬 Corner Analysis",
 ])
 
 # ── helpers shared across tabs ────────────────────────────────────────────────
@@ -413,7 +431,7 @@ with tab1:
     fig = go.Figure()
 
     if show_weather and not weather_df.empty:
-        weather_df["date"] = pd.to_datetime(weather_df["date"], utc=True)
+        weather_df["date"] = pd.to_datetime(weather_df["date"], format="ISO8601", utc=True)
         weather_df["track_temperature"] = pd.to_numeric(weather_df["track_temperature"], errors="coerce")
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                             row_heights=[0.75, 0.25], vertical_spacing=0.05)
@@ -594,27 +612,47 @@ with tab4:
 
     if not TELEMETRY_AVAILABLE:
         st.error("telemetry.py not found in the same folder as app.py.")
-    elif SESSION_LAP_COUNTS.get(session_type,"medium") == "low":
-        st.warning("⚠️ This is a qualifying session with very few laps. Location data is often absent. "
-                   "Switch to a Practice session for best results.")
-        if not st.checkbox("Try anyway"):
-            st.stop()
     else:
-        from telemetry import extract_track_outline, build_fastest_driver_map, make_channel_map, make_linked_telemetry_figure
+        from telemetry import build_fastest_driver_map, make_channel_map, make_telemetry_traces
+        if DATA_LAYER_AVAILABLE:
+            from data_layer import (get_track_outline, get_multi_driver_telemetry,
+                                    get_delta_to_ref, get_qual_best_telemetry,
+                                    get_qual_segments)
+
+        # ── Source badge ──────────────────────────────────────────────────
+        if fastf1_available():
+            st.success("⚡ FastF1 active — distance-aligned 240 Hz telemetry")
+        else:
+            st.info("📡 OpenF1 only — install fastf1 for higher-quality telemetry")
+
+        is_qual = SESSION_LAP_COUNTS.get(session_type, "medium") == "low"
+
+        # ── Q segment selector (qual sessions only) ───────────────────────
+        if is_qual and DATA_LAYER_AVAILABLE and fastf1_available():
+            avail_segs = get_qual_segments(year, meeting_location)
+            q_seg_sel  = st.radio("Q Segment", avail_segs, horizontal=True, key="q_seg")
+        else:
+            q_seg_sel = None
 
         map_mode = st.radio("Map mode",
-                            ["🏆 Fastest Driver","📡 Single Driver Channel"],
+                            ["🏆 Fastest Driver", "📡 Single Driver Channel"],
                             horizontal=True, key="map_mode")
 
-        tc1, tc2 = st.columns([3,2])
+        tc1, tc2 = st.columns([3, 2])
         with tc1:
-            all_lap_nums = sorted(laps_df["lap_number"].dropna().astype(int).unique().tolist())
-            vl = laps_df[laps_df["lap_duration"].notna() & (laps_df["lap_duration"]>0)]
-            best_overall_lap = int(vl.loc[vl["lap_duration"].idxmin(),"lap_number"]) if not vl.empty else (all_lap_nums[0] if all_lap_nums else 1)
-            default_lap_idx = all_lap_nums.index(best_overall_lap) if best_overall_lap in all_lap_nums else 0
-            selected_lap = st.selectbox("Lap", all_lap_nums, index=default_lap_idx,
-                                        format_func=lambda n: f"Lap {n}" + (" ★ fastest" if n==best_overall_lap else ""),
-                                        key="tel_lap")
+            if is_qual and q_seg_sel:
+                st.caption(f"Using each driver's best {q_seg_sel} lap")
+                selected_lap = None
+            else:
+                all_lap_nums = sorted(laps_df["lap_number"].dropna().astype(int).unique().tolist())
+                vl = laps_df[laps_df["lap_duration"].notna() & (laps_df["lap_duration"] > 0)]
+                best_overall_lap = (int(vl.loc[vl["lap_duration"].idxmin(), "lap_number"])
+                                    if not vl.empty else (all_lap_nums[0] if all_lap_nums else 1))
+                default_lap_idx  = all_lap_nums.index(best_overall_lap) if best_overall_lap in all_lap_nums else 0
+                selected_lap = st.selectbox(
+                    "Lap", all_lap_nums, index=default_lap_idx,
+                    format_func=lambda n: f"Lap {n}" + (" ★ fastest" if n == best_overall_lap else ""),
+                    key="tel_lap")
         with tc2:
             ref_outline_driver = st.selectbox("Track outline reference driver",
                                               selected_drivers["name_acronym"].tolist(),
@@ -625,109 +663,181 @@ with tab4:
             with sc1:
                 single_drv_name = st.selectbox("Driver", selected_drivers["name_acronym"].tolist(), key="single_drv")
             with sc2:
-                channel_opts = {"Throttle %":"throttle","Brake":"brake","Speed":"speed","Gear":"n_gear"}
+                channel_opts  = {"Throttle %": "throttle", "Brake": "brake", "Speed": "speed", "Gear": "n_gear"}
                 channel_label = st.selectbox("Channel", list(channel_opts.keys()), key="channel")
-                channel = channel_opts[channel_label]
+                channel       = channel_opts[channel_label]
+        else:
+            single_drv_name = selected_drivers["name_acronym"].iloc[0]
+            channel = "speed"
 
-        drv_colors_fetched = {r.get("name_acronym"): drv_color_str(r) for _,r in selected_drivers.iterrows()}
-        ref_drv_row = selected_drivers[selected_drivers["name_acronym"]==ref_outline_driver].iloc[0]
+        drv_colors_fetched = {r.get("name_acronym"): drv_color_str(r) for _, r in selected_drivers.iterrows()}
+        ref_drv_row = selected_drivers[selected_drivers["name_acronym"] == ref_outline_driver].iloc[0]
         ref_drv_num = int(ref_drv_row["driver_number"])
 
+        # ── Track outline ─────────────────────────────────────────────────
         @st.cache_data(ttl=3600, show_spinner=False)
-        def _cached_outline(s_key, d_num, _h):
-            return extract_track_outline(s_key, d_num, laps_df)
+        def _cached_outline(yr, rnd, sname, s_key, d_num, _h):
+            if DATA_LAYER_AVAILABLE:
+                x, y, src = get_track_outline(yr, rnd, sname, s_key, d_num, laps_df)
+                return x, y, src
+            from telemetry import extract_track_outline
+            x, y = extract_track_outline(s_key, d_num, laps_df)
+            return x, y, "openf1"
 
-        with st.spinner(f"Building track outline from {ref_outline_driver}'s best lap…"):
-            track_x, track_y = _cached_outline(session_key, ref_drv_num, len(laps_df))
-
+        with st.spinner("Building track outline…"):
+            track_x, track_y, outline_src = _cached_outline(
+                year, meeting_location, session_type, session_key, ref_drv_num, len(laps_df))
         if len(track_x) == 0:
-            st.warning(f"No location data for {ref_outline_driver}. Try a different driver or a Practice session.")
+            st.warning(f"No location data for {ref_outline_driver}.")
+
+        # ── Telemetry fetch ───────────────────────────────────────────────
+        import json as _json
+        drv_list_json = _json.dumps([
+            {"acronym": r.get("name_acronym"), "driver_number": int(r["driver_number"]),
+             "team_colour": str(r.get("team_colour", "fff"))}
+            for _, r in selected_drivers.iterrows()
+        ])
 
         @st.cache_data(ttl=3600, show_spinner=False)
-        def _cached_tel(s_key, d_num, lap_num, _h):
-            return fetch_lap_telemetry(s_key, d_num, lap_num, laps_df)
+        def _fetch_qual_tel(yr, rnd, s_key, seg, drv_json, _h):
+            import json as _j
+            result = {}
+            for drv in _j.loads(drv_json):
+                tel, lap_t, lap_num = get_qual_best_telemetry(
+                    drv["acronym"], seg, yr, rnd,
+                    s_key, drv["driver_number"], laps_df)
+                if not tel.empty:
+                    tel = tel.copy()
+                    tel["_lap_time"] = lap_t
+                    tel["_lap_num"]  = lap_num
+                    result[drv["acronym"]] = tel
+            return result
 
-        tel_dict = {}
-        fp = st.progress(0, text="Fetching telemetry…")
-        drv_list = selected_drivers["name_acronym"].tolist()
-        for fi, (_, drv) in enumerate(selected_drivers.iterrows()):
-            acr   = drv.get("name_acronym"); d_num = int(drv["driver_number"])
-            lap_ex = not laps_df[(laps_df["driver_number"]==d_num)&(laps_df["lap_number"]==selected_lap)].empty
-            if lap_ex:
-                td = _cached_tel(session_key, d_num, selected_lap, len(laps_df))
-                if not td.empty: tel_dict[acr] = td
-            fp.progress((fi+1)/len(drv_list), text=f"Fetching {acr}…")
-        fp.empty()
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def _fetch_lap_tel(yr, rnd, sname, s_key, lap_num, drv_json, _h):
+            import json as _j
+            if DATA_LAYER_AVAILABLE:
+                return get_multi_driver_telemetry(
+                    drivers=_j.loads(drv_json), lap_number=lap_num,
+                    year=yr, gp=rnd, session_name=sname,
+                    session_key=s_key, laps_df=laps_df)
+            from telemetry import fetch_lap_telemetry
+            result = {}
+            for drv in _j.loads(drv_json):
+                td = fetch_lap_telemetry(s_key, drv["driver_number"], lap_num, laps_df)
+                if not td.empty:
+                    td["source"] = "openf1"
+                    _dx = np.diff(pd.to_numeric(td.get("x", pd.Series(dtype=float)), errors="coerce").fillna(0).values, prepend=0)
+                    _dy = np.diff(pd.to_numeric(td.get("y", pd.Series(dtype=float)), errors="coerce").fillna(0).values, prepend=0)
+                    td["distance"] = np.cumsum(np.sqrt(_dx**2 + _dy**2))
+                    result[drv["acronym"]] = td
+            return result
+
+        with st.spinner("Fetching telemetry…"):
+            if is_qual and q_seg_sel and DATA_LAYER_AVAILABLE:
+                tel_dict = _fetch_qual_tel(year, meeting_location, session_key,
+                                           q_seg_sel, drv_list_json, len(laps_df))
+            else:
+                tel_dict = _fetch_lap_tel(year, meeting_location, session_type,
+                                          session_key, selected_lap,
+                                          drv_list_json, len(laps_df))
 
         if not tel_dict:
-            st.warning("No telemetry data for this lap. Try another lap or a Practice session.")
+            st.warning("No telemetry data. Try a different lap or segment.")
         else:
             def _mini(label, val):
-                return f"<div class='metric-card'><div class='metric-label'>{label}</div><div class='metric-value' style='font-size:15px;'>{val}</div></div>"
+                return (f"<div class='metric-card'><div class='metric-label'>{label}</div>"
+                        f"<div class='metric-value' style='font-size:15px;'>{val}</div></div>")
 
-            mc = st.columns(len(tel_dict)+1)
-            mc[0].markdown(_mini("Lap", str(selected_lap)), unsafe_allow_html=True)
-            for ci,(acr,td) in enumerate(tel_dict.items()):
-                dlr = laps_df[(laps_df["acronym"]==acr)&(laps_df["lap_number"]==selected_lap)]
-                lt  = fmt_time(dlr["lap_duration"].values[0]) if not dlr.empty else "—"
-                c   = drv_colors_fetched.get(acr,"#fff")
-                mc[ci+1].markdown(f"<div class='metric-card' style='border-top:3px solid {c};'><div class='metric-label' style='color:{c};'>{acr}</div><div class='metric-value' style='font-size:15px;'>{lt}</div><div style='font-size:10px;color:#555;'>{len(td)} samples</div></div>", unsafe_allow_html=True)
+            def _clean(td):
+                return td.drop(columns=[c for c in ["_lap_time","_lap_num"] if c in td.columns])
+
+            clean_tel = {acr: _clean(td) for acr, td in tel_dict.items()}
+
+            mc = st.columns(len(tel_dict) + 1)
+            seg_label = q_seg_sel if (is_qual and q_seg_sel) else f"Lap {selected_lap}"
+            mc[0].markdown(_mini("Segment", seg_label), unsafe_allow_html=True)
+            for ci, (acr, td) in enumerate(tel_dict.items()):
+                c   = drv_colors_fetched.get(acr, "#fff")
+                src = td["source"].iloc[0] if "source" in td.columns else "openf1"
+                src_badge = "🟢 FF1" if src == "fastf1" else "🔵 OF1"
+                if "_lap_time" in td.columns and td["_lap_time"].iloc[0] is not None:
+                    lt      = fmt_time(td["_lap_time"].iloc[0])
+                    lap_lbl = f"Lap {int(td['_lap_num'].iloc[0])}" if "_lap_num" in td.columns else ""
+                else:
+                    dlr     = laps_df[(laps_df["acronym"]==acr)&(laps_df["lap_number"]==selected_lap)]
+                    lt      = fmt_time(dlr["lap_duration"].values[0]) if not dlr.empty else "—"
+                    lap_lbl = ""
+                mc[ci+1].markdown(
+                    f"<div class='metric-card' style='border-top:3px solid {c};'>"
+                    f"<div class='metric-label' style='color:{c};'>{acr} "
+                    f"<span style='font-size:9px;color:#555;'>{src_badge}</span></div>"
+                    f"<div class='metric-value' style='font-size:15px;'>{lt}</div>"
+                    f"<div style='font-size:10px;color:#555;'>{lap_lbl} · {len(td)} samples</div></div>",
+                    unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-
             if map_mode == "🏆 Fastest Driver":
-                map_fig = build_fastest_driver_map(tel_dict, drv_colors_fetched, track_x, track_y)
+                map_fig = build_fastest_driver_map(clean_tel, drv_colors_fetched, track_x, track_y)
             else:
-                map_fig = make_channel_map(tel_dict.get(single_drv_name, pd.DataFrame()),
+                map_fig = make_channel_map(clean_tel.get(single_drv_name, pd.DataFrame()),
                                            channel, single_drv_name,
-                                           drv_colors_fetched.get(single_drv_name,"#fff"),
+                                           drv_colors_fetched.get(single_drv_name, "#fff"),
                                            track_x, track_y)
 
-            st.caption("🖱️ Click a point on the track map to pin a marker on the telemetry graphs below.")
+            st.caption("🖱️ Click a point on the map to pin a crosshair on the telemetry traces.")
+            map_event = st.plotly_chart(map_fig, use_container_width=True,
+                                        on_select="rerun", key="map_click")
 
-            map_event = st.plotly_chart(
-                map_fig,
-                use_container_width=True,
-                on_select="rerun",
-                key="map_click",
-            )
-
-            # Resolve clicked map xy -> nearest sample index per driver
-            pinned_samples = {}
+            pinned_x = {}
             if map_event and map_event.selection and map_event.selection.get("points"):
                 pt = map_event.selection["points"][0]
-                click_x = pt.get("x")
-                click_y = pt.get("y")
-                if click_x is not None and click_y is not None:
-                    for acr, td in tel_dict.items():
-                        if "x" not in td.columns or "y" not in td.columns:
-                            continue
-                        dx = pd.to_numeric(td["x"], errors="coerce").values
-                        dy = pd.to_numeric(td["y"], errors="coerce").values
-                        valid = ~(np.isnan(dx) | np.isnan(dy))
-                        if not valid.any():
-                            continue
-                        dists = (dx[valid] - click_x)**2 + (dy[valid] - click_y)**2
-                        nearest = int(np.where(valid)[0][np.argmin(dists)])
-                        pinned_samples[acr] = nearest
+                cx, cy = pt.get("x"), pt.get("y")
+                if cx is not None and cy is not None:
+                    for acr, td in clean_tel.items():
+                        if "x" not in td.columns or "y" not in td.columns: continue
+                        _dx = pd.to_numeric(td["x"], errors="coerce").values
+                        _dy = pd.to_numeric(td["y"], errors="coerce").values
+                        valid = ~(np.isnan(_dx) | np.isnan(_dy))
+                        if not valid.any(): continue
+                        nn = int(np.where(valid)[0][np.argmin((_dx[valid]-cx)**2 + (_dy[valid]-cy)**2)])
+                        pinned_x[acr] = float(td["distance"].iloc[nn]) if "distance" in td.columns else nn
 
             st.markdown('<div class="section-header">Throttle · Brake · Speed · Gear</div>', unsafe_allow_html=True)
-            traces_fig = make_telemetry_traces(tel_dict, drv_colors_fetched)
-
-            # Inject per-driver vertical lines at their pinned sample index
-            if pinned_samples:
-                for acr, sample_idx in pinned_samples.items():
-                    color = drv_colors_fetched.get(acr, "#ffffff")
-                    traces_fig.add_vline(
-                        x=sample_idx,
-                        line=dict(color=color, width=1.5, dash="dash"),
-                        annotation_text=acr,
-                        annotation_position="top",
-                        annotation_font=dict(color=color, size=10),
-                    )
-
+            traces_fig = make_telemetry_traces(clean_tel, drv_colors_fetched)
+            for acr, x_val in pinned_x.items():
+                col = drv_colors_fetched.get(acr, "#fff")
+                traces_fig.add_vline(x=x_val, line=dict(color=col, width=1.5, dash="dash"),
+                                     annotation_text=acr, annotation_position="top",
+                                     annotation_font=dict(color=col, size=10))
             st.plotly_chart(traces_fig, use_container_width=True)
+
+            if DATA_LAYER_AVAILABLE and len(clean_tel) >= 2:
+                st.markdown('<div class="section-header">⏱ Time Delta by Distance</div>', unsafe_allow_html=True)
+                ref_acr   = st.selectbox("Reference driver", list(clean_tel.keys()), key="delta_ref")
+                delta_fig = go.Figure()
+                for acr, td in clean_tel.items():
+                    if acr == ref_acr: continue
+                    color    = drv_colors_fetched.get(acr, "#fff")
+                    delta_df = get_delta_to_ref(ref_acr, acr, clean_tel[ref_acr], td)
+                    if delta_df.empty: continue
+                    delta_fig.add_trace(go.Scatter(
+                        x=delta_df["distance"], y=delta_df["delta"],
+                        mode="lines", name=f"{acr} vs {ref_acr}",
+                        line=dict(color=color, width=2),
+                        hovertemplate=f"<b>{acr}</b> %{{x:.0f}}m → %{{y:+.3f}}s<extra></extra>",
+                    ))
+                if delta_fig.data:
+                    delta_fig.add_hline(y=0, line_dash="dot", line_color="#555")
+                    delta_fig.update_layout(
+                        template="plotly_dark", paper_bgcolor="#0d0d0f", plot_bgcolor="#13131a",
+                        xaxis=dict(title="Distance (m)", gridcolor="#222"),
+                        yaxis=dict(title=f"Δ vs {ref_acr} (s)", gridcolor="#222", tickformat="+.3f"),
+                        legend=dict(bgcolor="#0d0d0f", bordercolor="#333", borderwidth=1),
+                        height=260, margin=dict(l=10,r=10,t=10,b=10), hovermode="x unified")
+                    st.plotly_chart(delta_fig, use_container_width=True)
+
 
 # TAB 5 — RACE POSITION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -741,7 +851,7 @@ with tab5:
     if pos_df.empty:
         st.warning("No position data available for this session.")
     else:
-        pos_df["date"]     = pd.to_datetime(pos_df["date"], utc=True)
+        pos_df["date"]     = pd.to_datetime(pos_df["date"], format="ISO8601", utc=True)
         pos_df["position"] = pd.to_numeric(pos_df["position"], errors="coerce")
         pos_df["driver_number"] = pd.to_numeric(pos_df["driver_number"], errors="coerce")
 
@@ -765,7 +875,7 @@ with tab5:
                 lt = laps_df[["lap_number","date_start","acronym"]].dropna()
                 for _,r in lt.iterrows():
                     key = (r["acronym"], int(r["lap_number"]))
-                    lap_times_map[key] = pd.to_datetime(r["date_start"], utc=True)
+                    lap_times_map[key] = pd.to_datetime(r["date_start"], format="ISO8601", utc=True)
 
             for _, drv in selected_drivers.iterrows():
                 acr   = drv.get("name_acronym")
@@ -903,14 +1013,14 @@ with tab7:
     if radio_df.empty:
         st.info(f"No team radio clips found for {radio_driver} in this session.")
     else:
-        radio_df["date"] = pd.to_datetime(radio_df["date"], utc=True)
+        radio_df["date"] = pd.to_datetime(radio_df["date"], format="ISO8601", utc=True)
         radio_df = radio_df.sort_values("date").reset_index(drop=True)
         st.markdown(f"**{len(radio_df)} clips found for {radio_driver}**")
 
         # Try to match radio clip to lap number
         if "date_start" in laps_df.columns:
             drv_laps_radio = laps_df[laps_df["driver_number"]==radio_drv_num].copy()
-            drv_laps_radio["date_start"] = pd.to_datetime(drv_laps_radio["date_start"], utc=True)
+            drv_laps_radio["date_start"] = pd.to_datetime(drv_laps_radio["date_start"], format="ISO8601", utc=True)
             drv_laps_radio = drv_laps_radio.sort_values("date_start")
 
         for _, clip in radio_df.iterrows():
@@ -965,6 +1075,308 @@ with tab8:
     st.dataframe(table_df, use_container_width=True, height=500, hide_index=True)
     st.download_button("⬇️ Export table (CSV)", table_df.to_csv(index=False),
                        file_name=f"f1_table_{session_key}.csv", mime="text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 9 — CORNER ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab9:
+    st.markdown('<div class="section-header">Corner Analysis</div>', unsafe_allow_html=True)
+
+    if not DATA_LAYER_AVAILABLE:
+        st.error("data_layer.py not found.")
+    elif not fastf1_available():
+        st.warning("Corner analysis requires FastF1. Run `pip install fastf1` and restart.")
+    else:
+        from data_layer import (get_qual_best_telemetry, get_qual_segments,
+                                detect_corners, corner_stats, get_delta_to_ref,
+                                get_track_outline)
+        from telemetry import build_fastest_driver_map, make_channel_map
+
+        is_qual_ca = SESSION_LAP_COUNTS.get(session_type, "medium") == "low"
+
+        st.info(
+            "Uses each driver's **fastest lap** in the selected segment. "
+            "Corners detected via track curvature. "
+            "Line overlay is indicative (±2m GPS accuracy); speed/delta data is exact."
+        )
+
+        # ── Segment + driver colour map ───────────────────────────────────
+        ca_segs = get_qual_segments(year, meeting_location) if is_qual_ca else ["Best"]
+        ca_seg  = st.radio("Lap source", ca_segs, horizontal=True, key="ca_seg")
+        drv_colors_ca = {r.get("name_acronym"): drv_color_str(r) for _, r in selected_drivers.iterrows()}
+
+        # ── Fetch best lap telemetry per driver ───────────────────────────
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def _ca_tel(yr, rnd, s_key, seg, drv_json, _h):
+            import json as _j
+            result = {}
+            for drv in _j.loads(drv_json):
+                tel, lap_t, lap_num = get_qual_best_telemetry(
+                    drv["acronym"], seg, yr, rnd,
+                    s_key, drv["driver_number"], laps_df)
+                if not tel.empty:
+                    tel = tel.copy()
+                    tel["_lap_time"] = lap_t
+                    result[drv["acronym"]] = tel
+            return result
+
+        import json as _json2
+        ca_drv_json = _json2.dumps([
+            {"acronym": r.get("name_acronym"), "driver_number": int(r["driver_number"])}
+            for _, r in selected_drivers.iterrows()
+        ])
+
+        with st.spinner("Fetching lap telemetry for corner analysis…"):
+            ca_tel = _ca_tel(year, meeting_location, session_key, ca_seg, ca_drv_json, len(laps_df))
+
+        # Strip helper cols
+        ca_clean = {}
+        for acr, td in ca_tel.items():
+            ca_clean[acr] = td.drop(columns=[c for c in ["_lap_time","_lap_num"] if c in td.columns])
+
+        if not ca_clean:
+            st.warning("No telemetry loaded. Check that FastF1 has indexed this session.")
+            st.stop()
+
+        # ── Detect corners from fastest driver's lap ───────────────────────
+        ref_drv_ca = list(ca_clean.keys())[0]
+        ref_tel_ca = ca_clean[ref_drv_ca]
+
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def _detect(tel_json_hash, _h):
+            return detect_corners(ref_tel_ca)
+
+        corners_df = _detect(str(len(ref_tel_ca)), len(laps_df))
+
+        if corners_df.empty:
+            st.warning("Could not detect corners from this telemetry. "
+                       "Try a different session or driver.")
+            st.stop()
+
+        # ── Lap time header strip ─────────────────────────────────────────
+        lt_cols = st.columns(len(ca_tel))
+        for ci, (acr, td) in enumerate(ca_tel.items()):
+            c   = drv_colors_ca.get(acr, "#fff")
+            lt  = fmt_time(td["_lap_time"].iloc[0]) if "_lap_time" in td.columns and td["_lap_time"].iloc[0] else "—"
+            lt_cols[ci].markdown(
+                f"<div class='metric-card' style='border-top:3px solid {c};'>"
+                f"<div class='metric-label' style='color:{c};'>{acr}</div>"
+                f"<div class='metric-value' style='font-size:16px;'>{lt}</div></div>",
+                unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Full-lap fastest-driver map ────────────────────────────────────
+        st.markdown('<div class="section-header">Full Lap — Fastest Driver by Sector</div>', unsafe_allow_html=True)
+        track_x_ca, track_y_ca, _ = get_track_outline(
+            year, meeting_location, session_type, session_key,
+            int(selected_drivers.iloc[0]["driver_number"]), laps_df)
+        full_map = build_fastest_driver_map(ca_clean, drv_colors_ca, track_x_ca, track_y_ca)
+        st.plotly_chart(full_map, use_container_width=True)
+
+        # ── Corner summary table ──────────────────────────────────────────
+        st.markdown('<div class="section-header">Corner-by-Corner Summary</div>', unsafe_allow_html=True)
+        stats_df = corner_stats(ca_clean, corners_df)
+
+        if not stats_df.empty:
+            # Pivot to wide: one row per corner, columns per driver
+            pivot = stats_df.pivot(index="corner_num", columns="driver",
+                                   values=["apex_speed_kmh","brake_dist_before_apex_m",
+                                           "throttle_dist_after_apex_m","time_in_corner_s"])
+            pivot.columns = [f"{drv} {metric.replace('_',' ')}" for metric, drv in pivot.columns]
+            pivot = pivot.reset_index().rename(columns={"corner_num": "Corner"})
+
+            # Highlight fastest driver per corner (lowest time_in_corner_s)
+            st.dataframe(pivot, use_container_width=True, hide_index=True)
+
+            # Who was fastest through each corner
+            st.markdown('<div class="section-header">Corner Wins</div>', unsafe_allow_html=True)
+            win_cols = st.columns(min(6, len(corners_df)))
+            for ci, (_, corner) in enumerate(corners_df.iterrows()):
+                cnum = int(corner["corner_num"])
+                col_i = ci % len(win_cols)
+                corner_stats_row = stats_df[stats_df["corner_num"] == cnum]
+                if corner_stats_row.empty:
+                    continue
+                fastest = corner_stats_row.loc[corner_stats_row["time_in_corner_s"].idxmin()]
+                fdrv    = fastest["driver"]
+                ftime   = fastest["time_in_corner_s"]
+                fcolor  = drv_colors_ca.get(fdrv, "#fff")
+                win_cols[col_i].markdown(
+                    f"<div class='metric-card' style='border-top:2px solid {fcolor};margin-bottom:6px;'>"
+                    f"<div class='metric-label'>T{cnum}</div>"
+                    f"<div style='font-size:14px;font-weight:700;color:{fcolor};'>{fdrv}</div>"
+                    f"<div style='font-size:10px;color:#555;'>{ftime:.3f}s</div></div>",
+                    unsafe_allow_html=True)
+
+        # ── Individual corner deep dive ────────────────────────────────────
+        st.markdown('<div class="section-header">Individual Corner Deep Dive</div>', unsafe_allow_html=True)
+        corner_nums  = corners_df["corner_num"].tolist()
+        corner_labels = [f"T{n}  ({corners_df.loc[corners_df['corner_num']==n,'length_m'].values[0]:.0f}m)"
+                         for n in corner_nums]
+        sel_corner_idx = st.selectbox("Corner", range(len(corner_nums)),
+                                      format_func=lambda i: corner_labels[i], key="ca_corner")
+        corner_row = corners_df.iloc[sel_corner_idx]
+
+        v_s    = float(corner_row["view_start"])
+        v_e    = float(corner_row["view_end"])
+        apex_d = float(corner_row["apex_dist"])
+
+        # ── Zoomed map ────────────────────────────────────────────────────
+        from plotly.subplots import make_subplots as _msp
+        fig_corner = go.Figure()
+
+        # Grey track background for this segment
+        for acr, td in ca_clean.items():
+            if "x" not in td.columns or "distance" not in td.columns:
+                continue
+            mask = (td["distance"] >= v_s) & (td["distance"] <= v_e)
+            if not mask.any():
+                continue
+            color = drv_colors_ca.get(acr, "#fff")
+            # Background outline (first driver only)
+            if acr == list(ca_clean.keys())[0]:
+                fig_corner.add_trace(go.Scatter(
+                    x=td.loc[mask,"x"], y=td.loc[mask,"y"],
+                    mode="lines", line=dict(color="#2a2a35", width=22),
+                    hoverinfo="skip", showlegend=False))
+
+            spd_seg = td.loc[mask,"speed"] if "speed" in td.columns else None
+            hover_corner = td.loc[mask].apply(
+                lambda r: f"<b>{acr}</b><br>Dist: {r['distance']:.0f}m<br>"
+                          f"Speed: {r.get('speed',0):.0f} km/h<br>"
+                          f"Throttle: {r.get('throttle',0):.0f}%<br>"
+                          f"Brake: {r.get('brake',0):.0f}%", axis=1
+            ).tolist()
+
+            fig_corner.add_trace(go.Scatter(
+                x=td.loc[mask,"x"], y=td.loc[mask,"y"],
+                mode="lines+markers",
+                line=dict(color=color, width=3),
+                marker=dict(
+                    size=5,
+                    color=td.loc[mask,"speed"] if spd_seg is not None else color,
+                    colorscale="RdYlGn", showscale=False,
+                    cmin=100, cmax=320,
+                ),
+                name=acr, text=hover_corner, hovertemplate="%{text}<extra></extra>",
+            ))
+
+        # Apex markers
+        for acr, td in ca_clean.items():
+            if "distance" not in td.columns: continue
+            apex_mask  = (td["distance"] - apex_d).abs()
+            closest    = apex_mask.idxmin()
+            color      = drv_colors_ca.get(acr, "#fff")
+            apex_speed = td.loc[closest,"speed"] if "speed" in td.columns else 0
+            fig_corner.add_trace(go.Scatter(
+                x=[td.loc[closest,"x"]], y=[td.loc[closest,"y"]],
+                mode="markers+text",
+                marker=dict(symbol="circle", size=12, color=color,
+                            line=dict(color="#000", width=2)),
+                text=[f"{acr}<br>{apex_speed:.0f}"],
+                textposition="top center",
+                textfont=dict(color=color, size=9),
+                hovertemplate=f"<b>{acr}</b> apex<br>{apex_speed:.0f} km/h<extra></extra>",
+                showlegend=False,
+            ))
+
+        fig_corner.update_layout(
+            template="plotly_dark", paper_bgcolor="#0d0d0f", plot_bgcolor="#0d0d0f",
+            xaxis=dict(visible=False, scaleanchor="y", scaleratio=1),
+            yaxis=dict(visible=False),
+            height=420, margin=dict(l=10,r=10,t=20,b=10),
+            legend=dict(bgcolor="rgba(13,13,15,0.85)", bordercolor="#333",
+                        borderwidth=1, font=dict(size=12)),
+            title=dict(text=f"Turn {int(corner_row['corner_num'])}  ·  "
+                            f"{corner_row['length_m']:.0f}m  ·  "
+                            f"apex {corner_row['apex_dist']:.0f}m",
+                       font=dict(color="#888", size=12)),
+        )
+        st.plotly_chart(fig_corner, use_container_width=True)
+
+        # ── Speed / throttle / brake traces through the corner ─────────────
+        from plotly.subplots import make_subplots as _msp2
+        fig_traces = _msp2(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                           subplot_titles=["Speed (km/h)", "Throttle (%)", "Brake"],
+                           row_heights=[0.45, 0.3, 0.25])
+
+        for acr, td in ca_clean.items():
+            if "distance" not in td.columns: continue
+            mask  = (td["distance"] >= v_s) & (td["distance"] <= v_e)
+            if not mask.any(): continue
+            color = drv_colors_ca.get(acr, "#fff")
+            dist  = td.loc[mask,"distance"]
+
+            for row, ch in enumerate(["speed","throttle","brake"], 1):
+                if ch not in td.columns: continue
+                vals = td.loc[mask, ch]
+                fig_traces.add_trace(go.Scatter(
+                    x=dist, y=vals, mode="lines", name=acr,
+                    line=dict(color=color, width=2),
+                    legendgroup=acr, showlegend=(row==1),
+                    hovertemplate=f"<b>{acr}</b> {ch}: %{{y:.1f}}<extra></extra>",
+                ), row=row, col=1)
+
+        # Mark apex distance
+        fig_traces.add_vline(x=apex_d, line=dict(color="#888", width=1, dash="dot"),
+                             annotation_text="apex", annotation_font=dict(color="#888", size=9))
+
+        for r in range(1,4):
+            fig_traces.update_xaxes(
+                gridcolor="#1e1e2a", zeroline=False,
+                showspikes=True, spikemode="across", spikesnap="cursor",
+                spikecolor="#aaa", spikethickness=1, row=r, col=1)
+            fig_traces.update_yaxes(gridcolor="#1e1e2a", zeroline=False, row=r, col=1)
+
+        fig_traces.update_xaxes(title_text="Distance (m)", row=3, col=1)
+        fig_traces.update_layout(
+            template="plotly_dark", paper_bgcolor="#0d0d0f", plot_bgcolor="#13131a",
+            font=dict(family="Exo 2, sans-serif", color="#ccc", size=11),
+            height=480, margin=dict(l=10,r=10,t=30,b=10),
+            hovermode="x unified",
+            legend=dict(bgcolor="#0d0d0f", bordercolor="#333", borderwidth=1),
+        )
+        st.plotly_chart(fig_traces, use_container_width=True)
+
+        # ── Delta time through the corner ──────────────────────────────────
+        if len(ca_clean) >= 2:
+            st.markdown('<div class="section-header">⏱ Time Delta Through Corner</div>', unsafe_allow_html=True)
+            ref_ca    = st.selectbox("Reference driver (delta)", list(ca_clean.keys()), key="ca_delta_ref")
+            delta_fig = go.Figure()
+            for acr, td in ca_clean.items():
+                if acr == ref_ca: continue
+                color    = drv_colors_ca.get(acr, "#fff")
+                full_delta = get_delta_to_ref(ref_ca, acr, ca_clean[ref_ca], td)
+                if full_delta.empty: continue
+                # Clip to corner window
+                mask_d = (full_delta["distance"] >= v_s) & (full_delta["distance"] <= v_e)
+                seg    = full_delta[mask_d]
+                if seg.empty: continue
+                # Offset so delta=0 at corner entry
+                offset = seg["delta"].iloc[0]
+                delta_fig.add_trace(go.Scatter(
+                    x=seg["distance"], y=seg["delta"] - offset,
+                    mode="lines", name=f"{acr} vs {ref_ca}",
+                    line=dict(color=color, width=2),
+                    hovertemplate=f"<b>{acr}</b> %{{x:.0f}}m → %{{y:+.3f}}s<extra></extra>",
+                ))
+
+            if delta_fig.data:
+                delta_fig.add_vline(x=apex_d, line=dict(color="#888", width=1, dash="dot"),
+                                    annotation_text="apex", annotation_font=dict(color="#888", size=9))
+                delta_fig.add_hline(y=0, line_dash="dot", line_color="#555")
+                delta_fig.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0d0d0f", plot_bgcolor="#13131a",
+                    xaxis=dict(title="Distance (m)", gridcolor="#222"),
+                    yaxis=dict(title=f"Δ vs {ref_ca} (s, zeroed at entry)", gridcolor="#222",
+                               tickformat="+.3f"),
+                    legend=dict(bgcolor="#0d0d0f", bordercolor="#333", borderwidth=1),
+                    height=240, margin=dict(l=10,r=10,t=10,b=10), hovermode="x unified")
+                st.plotly_chart(delta_fig, use_container_width=True)
+                st.caption("Delta zeroed at corner entry — positive = comp lost time vs reference through this corner.")
+
 
 # ─── FOOTER ───────────────────────────────────────────────────────────────────
 st.markdown("""

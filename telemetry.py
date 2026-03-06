@@ -373,42 +373,60 @@ def make_channel_map(telemetry_df, channel, driver_acronym, team_color, track_x,
 def make_telemetry_traces(telemetry_dict, driver_colors):
     from plotly.subplots import make_subplots
 
+    # Detect if we have real distance data (FastF1) or sample index (OpenF1)
+    use_distance = any(
+        "distance" in df.columns and df["distance"].notna().any()
+        for df in telemetry_dict.values() if not df.empty
+    )
+    sources = set(
+        df["source"].iloc[0] for df in telemetry_dict.values()
+        if not df.empty and "source" in df.columns
+    )
+    x_label = "Distance (m)" if use_distance else "Sample index (≈ distance proxy)"
+    x_label += "  ·  FastF1" if "fastf1" in sources else "  ·  OpenF1"
+
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
         subplot_titles=["Throttle (%)", "Brake", "Speed (km/h)", "Gear"],
         row_heights=[0.32, 0.18, 0.32, 0.18],
     )
     channels = ["throttle", "brake", "speed", "n_gear"]
-    row_map = {c: i + 1 for i, c in enumerate(channels)}
+    row_map  = {c: i + 1 for i, c in enumerate(channels)}
 
     for acronym, tel_df in telemetry_dict.items():
         if tel_df.empty:
             continue
-        color = driver_colors.get(acronym, "#ffffff")
+        color      = driver_colors.get(acronym, "#ffffff")
         fill_color = _hex_to_rgba(color, 0.25)
-        x_idx = list(range(len(tel_df)))
+
+        # X axis: real distance if available, else sample index
+        if use_distance and "distance" in tel_df.columns:
+            x_vals = tel_df["distance"].fillna(method="ffill").values
+        else:
+            x_vals = np.arange(len(tel_df))
 
         for ch in channels:
             if ch not in tel_df.columns:
                 continue
-            vals = tel_df[ch].fillna(0).values
-            row = row_map[ch]
+            vals     = tel_df[ch].fillna(0).values
+            row      = row_map[ch]
             show_leg = (ch == "throttle")
+            ht = f"<b>{acronym}</b> %{{x:.0f}}{'m' if use_distance else ''} → {ch}: %{{y:.1f}}<extra></extra>"
 
             if ch == "brake":
                 fig.add_trace(go.Scatter(
-                    x=x_idx, y=vals, mode="lines",
+                    x=x_vals, y=vals, mode="lines",
                     line=dict(color=color, width=1.5),
                     fill="tozeroy", fillcolor=fill_color,
                     name=acronym, legendgroup=acronym, showlegend=show_leg,
-                    hovertemplate=f"<b>{acronym}</b> Brake: %{{y}}<extra></extra>",
+                    hovertemplate=ht,
                 ), row=row, col=1)
             else:
                 fig.add_trace(go.Scatter(
-                    x=x_idx, y=vals, mode="lines",
+                    x=x_vals, y=vals, mode="lines",
                     line=dict(color=color, width=1.8),
                     name=acronym, legendgroup=acronym, showlegend=show_leg,
-                    hovertemplate=f"<b>{acronym}</b> {ch}: %{{y}}<extra></extra>",
+                    hovertemplate=ht,
                 ), row=row, col=1)
 
     fig.update_layout(
@@ -426,7 +444,7 @@ def make_telemetry_traces(telemetry_dict, driver_colors):
             row=i, col=1,
         )
         fig.update_yaxes(gridcolor="#1e1e2a", zeroline=False, row=i, col=1)
-    fig.update_xaxes(title_text="Sample index (≈ distance proxy)", row=4, col=1)
+    fig.update_xaxes(title_text=x_label, row=4, col=1)
     return fig
 
 
